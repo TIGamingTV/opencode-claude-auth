@@ -84,6 +84,26 @@ describe("refresh-backoff", () => {
     })
   })
 
+  // Regression pin: MAX_COOLDOWN_MS gates isRefreshCooldownActive, which
+  // refreshIfNeeded consults on the REACTIVE path too (a real user request
+  // within 60s of token expiry). A single-instance account with no sibling
+  // to adopt a fresh token from is refused a refresh attempt for as long as
+  // this is set to, so a value here in the tens-of-minutes range turns one
+  // transient blip into an apparently-dead plugin for that whole window. An
+  // earlier revision raised the default to 30 minutes to throttle the
+  // proactive timer (opencode-claude-auth#270) and broke exactly this —
+  // reported as "the plugin does nothing when I send a prompt". That fix now
+  // lives in index.ts's own proactive-only skip counter instead, which never
+  // touches this constant. Keep the default well under a minute.
+  it("defaults to a short ceiling so a reactive request is never locked out for long", () => {
+    assert.ok(
+      MAX_COOLDOWN_MS <= 60_000,
+      `MAX_COOLDOWN_MS default is ${MAX_COOLDOWN_MS}ms — this gates real user ` +
+        `requests via refreshIfNeeded's reactive path, not just the proactive ` +
+        `timer, so it must stay short. Throttle the proactive timer separately.`,
+    )
+  })
+
   describe("cooldown lifecycle", () => {
     it("activates a cooldown on a transient failure and reports the failure kind", () => {
       const now = 1_000_000
