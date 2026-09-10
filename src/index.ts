@@ -246,8 +246,33 @@ const plugin: Plugin = async () => {
     // This prevents the "run `claude` to re-authenticate" message from
     // appearing mid-session when the token silently expires.
     let proactiveRefreshWarned = false
+
+    // Proactive-only backoff (opencode-claude-auth#270): how many ticks in a
+    // row to skip calling refreshIfNeeded at all once this process's own
+    // proactive attempts keep failing, so a sustained rate-limit doesn't cost
+    // 3 HTTP requests every SYNC_INTERVAL (5 min) forever. Deliberately local
+    // to this timer and never written to refresh-backoff.ts's shared cooldown
+    // — that cooldown also gates the REACTIVE path a real user request takes,
+    // so widening it (an earlier revision tried exactly that) can leave a
+    // single-instance account unable to refresh for as long as the widened
+    // cap, which is a worse regression than the request volume it fixed. This
+    // way a losing streak here can never add a single millisecond of wait to
+    // an actual prompt.
+    let proactiveConsecutiveFailures = 0
+    let proactiveSkipRemaining = 0
+    const PROACTIVE_SKIP_CAP = 5 // caps the gap at 6 * SYNC_INTERVAL (~30 min)
+
     const syncTimer = setInterval(async () => {
       try {
+        if (proactiveSkipRemaining > 0) {
+          proactiveSkipRemaining -= 1
+          log("proactive_refresh_check_skipped", {
+            remaining: proactiveSkipRemaining,
+            consecutiveFailures: proactiveConsecutiveFailures,
+          })
+          return
+        }
+
         const account = getActiveAccount()
         log("proactive_refresh_check", {
           source: account?.source ?? null,
@@ -265,6 +290,8 @@ const plugin: Plugin = async () => {
             log("proactive_refresh_recovered", { source: account?.source })
           }
           proactiveRefreshWarned = false
+          proactiveConsecutiveFailures = 0
+          proactiveSkipRemaining = 0
         } else if (account && wasRefreshDeferred(account.source)) {
           // refreshIfNeeded stepped aside rather than failing — a cooldown
           // from an earlier rate-limit was still armed, or a sibling
@@ -272,11 +299,19 @@ const plugin: Plugin = async () => {
           // multiple OpenCode instances sharing one account and say nothing
           // about the credentials themselves, which is why this used to warn
           // "re-authenticate" on tokens with hours of life left
-          // (opencode-claude-auth#272). Leave the once-per-outage latch
-          // alone: a real failure right after a deferral still reports.
+          // (opencode-claude-auth#272). Leave the once-per-outage latch (and
+          // the failure streak below) alone: a real failure right after a
+          // deferral still reports and still escalates.
           log("proactive_refresh_deferred", { source: account.source })
         } else {
           log("proactive_refresh_failed", { source: account?.source })
+          // A genuine failure (not a deferral): back this process's own
+          // timer off before the next attempt.
+          proactiveConsecutiveFailures += 1
+          proactiveSkipRemaining = Math.min(
+            PROACTIVE_SKIP_CAP,
+            2 ** (proactiveConsecutiveFailures - 1) - 1,
+          )
           // Only warn once per outage — otherwise this fires every
           // SYNC_INTERVAL (5 min) for as long as refresh keeps failing.
           if (!proactiveRefreshWarned) {

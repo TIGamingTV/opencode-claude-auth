@@ -1070,6 +1070,90 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
+  it("proactive timer backs off its own retry cadence after repeated genuine failures (#270)", async () => {
+    // Pins the fix for the regression this introduced when MAX_COOLDOWN_MS
+    // was raised to 30 minutes to solve #270: that widened the SAME cooldown
+    // refreshIfNeeded's reactive path (a real user request) checks, so a
+    // single-instance account with no sibling to adopt from could be refused
+    // for up to 30 minutes after one transient failure. The fix moves the
+    // throttle here — local to this timer, never touching refresh-backoff.ts
+    // — so it can reduce proactive request volume without ever adding a
+    // single millisecond of wait to an actual prompt.
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalDebug = process.env.CLAUDE_AUTH_DEBUG
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    const debugLogPath = join(tempHome, "debug.log")
+    process.env.HOME = tempHome
+    process.env.CLAUDE_AUTH_DEBUG = debugLogPath
+
+    let tickCallback: (() => void | Promise<void>) | undefined
+    globalThis.setInterval = ((cb: () => void | Promise<void>) => {
+      tickCallback = cb
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+
+    try {
+      const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
+        aExpiresAt: Date.now() - 60_000,
+        bExpiresAt: Date.now() + 30_000,
+        bRefreshResult: "fail",
+      })
+
+      const plugin = await helpersModule.default({} as never)
+      assert.ok(tickCallback)
+
+      const typedPlugin = plugin as {
+        auth?: {
+          methods?: Array<{
+            authorize?: (i: { account?: string }) => Promise<unknown>
+          }>
+        }
+      }
+      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
+      await writeFile(debugLogPath, "", "utf-8") // ignore init/authorize logs
+
+      // Fire 5 consecutive failed ticks. Escalation schedule (skip count =
+      // min(5, 2^(failures-1) - 1)): attempt, attempt, skip, attempt, skip —
+      // 3 real attempts, 2 skipped.
+      for (let i = 0; i < 5; i++) {
+        await tickCallback!()
+      }
+
+      const logs = (await readFile(debugLogPath, "utf-8"))
+        .split("\n")
+        .filter(Boolean)
+      const attempts = logs.filter((l) =>
+        l.includes('"event":"proactive_refresh_check"'),
+      )
+      const skipped = logs.filter((l) =>
+        l.includes('"event":"proactive_refresh_check_skipped"'),
+      )
+      assert.equal(
+        attempts.length,
+        3,
+        `Expected 3 real attempts across 5 ticks, got ${attempts.length}. Log: ${logs.join("\n")}`,
+      )
+      assert.equal(
+        skipped.length,
+        2,
+        `Expected 2 skipped ticks across 5 ticks, got ${skipped.length}. Log: ${logs.join("\n")}`,
+      )
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      if (originalDebug === undefined) {
+        delete process.env.CLAUDE_AUTH_DEBUG
+      } else {
+        process.env.CLAUDE_AUTH_DEBUG = originalDebug
+      }
+    }
+  })
+
   it("proactive refresh timer stays quiet when a refresh is merely deferred (#272)", async () => {
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME

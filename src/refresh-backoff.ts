@@ -22,20 +22,26 @@ export const BASE_COOLDOWN_MS = (() => {
 })()
 
 /**
- * Hard ceiling for a single cooldown (env-overridable). A short cap here
- * defeats its own purpose: the proactive sync timer polls every 5 minutes
- * (`SYNC_INTERVAL` in index.ts), so a cap at or below that interval means the
- * cooldown has always expired by the next tick and never actually gates the
- * proactive path — every tick re-hits the token endpoint for as long as it
- * keeps rate-limiting us, which is exactly the storm this module exists to
- * prevent (see opencode-claude-auth#270). 30 minutes lets consecutive
- * failures escalate past several proactive ticks while a single, isolated
- * blip still only pays the short base cooldown.
+ * Hard ceiling for a single cooldown, regardless of consecutive failures
+ * (env-overridable).
+ *
+ * This must stay short: `refreshIfNeeded()` consults `isRefreshCooldownActive`
+ * on the REACTIVE path too (a real user request whose token is within 60s of
+ * expiry), so whatever this is set to becomes the worst-case time a single
+ * interactive account with no sibling to adopt from is refused a refresh
+ * attempt entirely. An earlier revision raised this to 30 minutes to stop
+ * the proactive timer re-hitting a hard-blocked endpoint every 5 minutes
+ * (opencode-claude-auth#270) — that fixed the request-volume problem but
+ * traded it for a single-instance user being unable to send a message for up
+ * to 30 minutes after one transient blip, which is worse. #270's actual fix
+ * is `proactiveConsecutiveFailures`/`proactiveSkipRemaining` in index.ts: a
+ * proactive-timer-only backoff that reduces the same request volume without
+ * ever touching this shared, request-path-visible cooldown.
  */
 export const MAX_COOLDOWN_MS = (() => {
   const raw = process.env.OPENCODE_CLAUDE_AUTH_REFRESH_MAX_COOLDOWN_MS
   const parsed = raw ? Number.parseInt(raw, 10) : NaN
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30 * 60_000
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000
 })()
 
 /**
