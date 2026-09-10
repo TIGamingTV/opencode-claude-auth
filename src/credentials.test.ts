@@ -72,6 +72,15 @@ async function loadCredentialsWithCountingKeychain(
       rng?: () => number
     }) => Promise<Creds | null>
     getActiveRefreshFailureKind: () => "transient" | "terminal" | null
+    wasRefreshDeferred: (source: string) => boolean
+  }
+  backoffModule: {
+    noteRefreshTransient: (
+      source: string,
+      opts?: { retryAfterMs?: number; now?: number; rng?: () => number },
+    ) => number
+    clearRefreshOutcome: (source: string) => void
+    isRefreshCooldownActive: (source: string, now?: number) => boolean
   }
   keychainModule: {
     __getReadCount: () => number
@@ -105,6 +114,7 @@ async function loadCredentialsWithCountingKeychain(
   const tempLogger = join(tempDir, "logger.ts")
   const tempCredentials = join(tempDir, "credentials.ts")
   const tempHttp = join(tempDir, "http.ts")
+  const tempBackoff = join(tempDir, "refresh-backoff.ts")
   const sourceCredentials = await readFile(
     new URL("./credentials.ts", import.meta.url),
     "utf8",
@@ -116,7 +126,7 @@ async function loadCredentialsWithCountingKeychain(
     "utf8",
   )
   await writeFile(
-    join(tempDir, "refresh-backoff.ts"),
+    tempBackoff,
     await readFile(new URL("./refresh-backoff.ts", import.meta.url), "utf8"),
     "utf8",
   )
@@ -265,11 +275,12 @@ export function __setAccounts(list) {
   )
   await writeFile(tempCredentials, rewritten, "utf8")
 
-  const [credentialsModule, keychainModule, childProcessModule] =
+  const [credentialsModule, keychainModule, childProcessModule, backoffModule] =
     await Promise.all([
       import(pathToFileURL(tempCredentials).href),
       import(pathToFileURL(tempKeychain).href),
       import(pathToFileURL(tempChildProcess).href),
+      import(pathToFileURL(tempBackoff).href),
     ])
   const loggerModule = await import(pathToFileURL(tempLogger).href)
 
@@ -293,6 +304,15 @@ export function __setAccounts(list) {
       forceRefreshActiveAccount: (
         refresh?: (refreshToken: string) => Promise<Creds | null>,
       ) => Promise<Creds | null>
+      wasRefreshDeferred: (source: string) => boolean
+    },
+    backoffModule: backoffModule as {
+      noteRefreshTransient: (
+        source: string,
+        opts?: { retryAfterMs?: number; now?: number; rng?: () => number },
+      ) => number
+      clearRefreshOutcome: (source: string) => void
+      isRefreshCooldownActive: (source: string, now?: number) => boolean
     },
     keychainModule: keychainModule as {
       __getReadCount: () => number
@@ -3043,6 +3063,188 @@ describe("cross-process refresh lock (single-flight)", () => {
       } finally {
         held!.release()
       }
+    } finally {
+      Date.now = originalNow
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+// opencode-claude-auth#272: refreshIfNeeded() returned a bare `null` for a
+// cooldown-active or lock-busy *deferral*, which the proactive sync timer
+// (index.ts) read as "no usable credentials exist" and warned the user to
+// re-authenticate — even though the token itself still had hours of life
+// left and another refresher (or a still-armed cooldown) was the only
+// reason nothing was returned this call.
+describe("proactive deferral does not masquerade as a credential failure (#272)", () => {
+  const PROACTIVE_THRESHOLD_MS = 60 * 60_000 // mirrors index.ts's 1h window
+
+  it("keeps serving still-usable credentials while a refresh cooldown is active", async () => {
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+
+    try {
+      const { credentialsModule, keychainModule, backoffModule } =
+        await loadCredentialsWithCountingKeychain(now + 10 * 60_000)
+      // 10 minutes of life: well past the 60s reactive/CLI-fallback window,
+      // but inside the 1h proactive window, so the proactive call below
+      // reaches the "needs refresh" branch instead of short-circuiting.
+      const target = makeAccount(now + 10 * 60_000)
+      credentialsModule.initAccounts([target])
+      // Nothing rotated the store — adopting a sibling's token must fail.
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: now + 10 * 60_000,
+      })
+
+      // A prior transient failure armed a cooldown that is still active.
+      backoffModule.noteRefreshTransient("keychain", {
+        now,
+        retryAfterMs: 5 * 60_000,
+      })
+      assert.equal(backoffModule.isRefreshCooldownActive("keychain", now), true)
+
+      const result = await credentialsModule.refreshIfNeeded(
+        target,
+        PROACTIVE_THRESHOLD_MS,
+      )
+      assert.equal(
+        result?.accessToken,
+        "existing-token",
+        "still-usable credentials must be returned instead of null",
+      )
+      assert.equal(
+        credentialsModule.wasRefreshDeferred("keychain"),
+        true,
+        "the call must be recorded as a deferral, not a failure",
+      )
+    } finally {
+      Date.now = originalNow
+    }
+  })
+
+  it("keeps serving still-usable credentials when the lock holder publishes nothing new", async () => {
+    // Deliberately does NOT freeze Date.now(): waitForAdopt's poll loop
+    // compares real elapsed time against its own (unmockable through this
+    // public API) deadline, so a frozen clock never reaches it and hangs.
+    const now = Date.now()
+
+    const { credentialsModule, keychainModule } =
+      await loadCredentialsWithCountingKeychain(now + 10 * 60_000)
+    const target = makeAccount(now + 10 * 60_000)
+    credentialsModule.initAccounts([target])
+    keychainModule.__setCredentials({
+      accessToken: "existing-token",
+      refreshToken: "existing-refresh",
+      expiresAt: now + 10 * 60_000,
+    })
+
+    // A sibling process holds the lock and never rotates the store within
+    // the adopt window.
+    const held = acquireRefreshLock(target.source)
+    assert.ok(held, "test acquires the lock to simulate another process")
+    try {
+      const result = await credentialsModule.refreshIfNeeded(
+        target,
+        PROACTIVE_THRESHOLD_MS,
+      )
+      assert.equal(
+        result?.accessToken,
+        "existing-token",
+        "still-usable credentials must be returned instead of null",
+      )
+      assert.equal(
+        credentialsModule.wasRefreshDeferred("keychain"),
+        true,
+        "the call must be recorded as a deferral, not a failure",
+      )
+    } finally {
+      held!.release()
+    }
+  })
+
+  it("still returns null during a cooldown once credentials are inside the reactive window", async () => {
+    // Pins the reactive path: the guard must not start handing back
+    // expired-or-expiring tokens just because the call was a deferral.
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+
+    try {
+      const { credentialsModule, keychainModule, backoffModule } =
+        await loadCredentialsWithCountingKeychain(now - 1_000)
+      const target = makeAccount(now - 1_000)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: now - 1_000,
+      })
+      backoffModule.noteRefreshTransient("keychain", {
+        now,
+        retryAfterMs: 5 * 60_000,
+      })
+
+      const result = await credentialsModule.refreshIfNeeded(target)
+      assert.equal(result, null)
+      assert.equal(credentialsModule.wasRefreshDeferred("keychain"), true)
+    } finally {
+      Date.now = originalNow
+    }
+  })
+
+  it("clears the deferral marker once a later call actually attempts (and fails) a refresh", async () => {
+    const originalNow = Date.now
+    const originalFetch = globalThis.fetch
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: "invalid_grant",
+          error_description: "Refresh token expired",
+        }),
+        { status: 400 },
+      )) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule, backoffModule } =
+        await loadCredentialsWithCountingKeychain(now + 10 * 60_000)
+      const target = makeAccount(now + 10 * 60_000)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: now + 10 * 60_000,
+      })
+      backoffModule.noteRefreshTransient("keychain", {
+        now,
+        retryAfterMs: 5 * 60_000,
+      })
+
+      await credentialsModule.refreshIfNeeded(target, PROACTIVE_THRESHOLD_MS)
+      assert.equal(credentialsModule.wasRefreshDeferred("keychain"), true)
+
+      // Cooldown clears; the next call actually attempts a refresh, which
+      // fails terminally (dead refresh token) — a real failure, not a
+      // deferral, and must not be reported as one.
+      backoffModule.clearRefreshOutcome("keychain")
+      target.credentials.expiresAt = now - 1_000
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: now - 1_000,
+      })
+
+      const result = await credentialsModule.refreshIfNeeded(target)
+      assert.equal(result, null)
+      assert.equal(
+        credentialsModule.wasRefreshDeferred("keychain"),
+        false,
+        "a genuine refresh failure must clear the deferral marker",
+      )
     } finally {
       Date.now = originalNow
       globalThis.fetch = originalFetch

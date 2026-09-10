@@ -53,6 +53,33 @@ const borrowedCredentialAccounts = new WeakSet<ClaudeAccount>()
 let activeAccountSource: string | null = null
 let allAccounts: ClaudeAccount[] = []
 
+// Sources whose most recent refreshIfNeeded() call stepped aside rather than
+// failing: a cooldown from an earlier rate-limit was still armed, or a
+// sibling process/CLI held the cross-process refresh lock and didn't publish
+// a fresh token inside the short adopt window. Both are routine with
+// multiple OpenCode instances / a shared account and say nothing about
+// whether the credentials themselves are usable — `null` is this module's
+// signal for "no usable credentials exist," and conflating a deferral with
+// that made the proactive sync timer warn "re-authenticate" on tokens with
+// hours of remaining life (opencode-claude-auth#272). Reset at the top of
+// every refreshIfNeeded call, so it only ever describes the call that just
+// ran and can never suppress a later, genuine failure.
+const deferredRefreshSources = new Set<string>()
+
+function markRefreshDeferred(source: string): void {
+  deferredRefreshSources.add(source)
+}
+
+/**
+ * Whether `source`'s most recent refreshIfNeeded() call deferred to a
+ * cooldown or a busy lock rather than attempting (and failing) a refresh.
+ * Callers that turn a `null` result into a user-facing "re-authenticate"
+ * warning should check this first and stay quiet on a deferral.
+ */
+export function wasRefreshDeferred(source: string): boolean {
+  return deferredRefreshSources.has(source)
+}
+
 export function initAccounts(accounts: ClaudeAccount[]): void {
   allAccounts = accounts
 }
@@ -323,12 +350,23 @@ export async function refreshViaOAuthDetailed(
 
   try {
     log("refresh_started", { source: "oauth" })
-    const response = await fetchWithRetry(OAUTH_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      signal: controller.signal,
-    })
+    // Capped at one retry (2 attempts), not fetchWithRetry's default 3. This
+    // call sits inside refreshIfNeeded's own cooldown/backoff (see
+    // refresh-backoff.ts), which already governs when the *next* refresh is
+    // attempted; letting a single call additionally burn 3 requests against
+    // an endpoint that is actively rate-limiting us just amplifies the
+    // problem it's trying to recover from (opencode-claude-auth#270). One
+    // retry still absorbs an isolated blip without the extra request.
+    const response = await fetchWithRetry(
+      OAUTH_TOKEN_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        signal: controller.signal,
+      },
+      2,
+    )
 
     if (!response.ok) {
       // Capture the token endpoint's own failure reason (invalid_grant,
@@ -451,6 +489,10 @@ export async function refreshIfNeeded(
   const target = account ?? getActiveAccount()
   if (!target) return null
 
+  // Describes only the call about to run, never a previous one — see
+  // deferredRefreshSources above.
+  deferredRefreshSources.delete(target.source)
+
   // Pick up credentials replaced externally — cswap switching accounts, the
   // claude CLI in another terminal, or a second OpenCode instance. This was
   // once limited to file sources, on the false assumption that a keychain
@@ -520,7 +562,7 @@ export async function refreshIfNeeded(
       source: target.source,
       until: getRefreshCooldownUntil(target.source),
     })
-    return null
+    return deferToUsableCredentials(target, creds, "cooldown")
   }
 
   // The proactive sync timer calls this directly while the request path
@@ -545,7 +587,7 @@ export async function refreshIfNeeded(
     // ages out by TTL). Defer rather than refresh lock-free, so we don't
     // recreate the burst the lock exists to prevent — the request-level wait
     // loop and the lock TTL drive eventual progress.
-    return null
+    return deferToUsableCredentials(target, creds, "lock_busy")
   }
 
   const pending = (async () => {
@@ -561,6 +603,34 @@ export async function refreshIfNeeded(
   } finally {
     inFlightRefreshes.delete(target.source)
   }
+}
+
+/**
+ * Called when refreshIfNeeded is stepping aside — a cooldown is armed, or the
+ * cross-process lock is held elsewhere — and adopting a sibling's fresh token
+ * didn't pan out. Marks the deferral (see deferredRefreshSources) and, if the
+ * credentials already in hand are still comfortably usable, returns them
+ * instead of null: mirrors the guard performRefresh's own transient and
+ * CLI-fallback branches apply before falling through to `null`. Only affects
+ * the proactive path in practice — the reactive 60s threshold means this is
+ * reached with `creds` already inside `CLI_FALLBACK_THRESHOLD_MS`, where the
+ * guard is false and `null` still stands (see opencode-claude-auth#272).
+ */
+function deferToUsableCredentials(
+  target: ClaudeAccount,
+  creds: ClaudeCredentials,
+  reason: "cooldown" | "lock_busy",
+): ClaudeCredentials | null {
+  markRefreshDeferred(target.source)
+  if (creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS) {
+    log("refresh_deferred_still_usable", {
+      source: target.source,
+      reason,
+      expiresIn: creds.expiresAt - Date.now(),
+    })
+    return creds
+  }
+  return null
 }
 
 /**

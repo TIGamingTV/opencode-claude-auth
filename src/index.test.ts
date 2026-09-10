@@ -275,6 +275,7 @@ async function loadHelpersWithMultiAccountKeychain(opts: {
   bRefreshResult: "success" | "fail"
 }): Promise<{
   helpersModule: typeof import("./index.ts")
+  tempDir: string
 }> {
   const tempDir = await mkdtemp(
     join(tmpdir(), "opencode-claude-auth-multi-acct-"),
@@ -315,7 +316,7 @@ export const PRIMARY_SERVICE = "Claude Code-credentials"
     pathToFileURL(join(tempDir, "index.ts")).href
   )
 
-  return { helpersModule }
+  return { helpersModule, tempDir }
 }
 
 function makeCreds(overrides?: Partial<ClaudeCredentials>): ClaudeCredentials {
@@ -1057,6 +1058,87 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         proactiveWarnings.length,
         1,
         `Expected exactly 1 warning across 3 failed ticks (latched), got ${proactiveWarnings.length}`,
+      )
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      console.warn = originalWarn
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+    }
+  })
+
+  it("proactive refresh timer stays quiet when a refresh is merely deferred (#272)", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalWarn = console.warn
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+
+    let tickCallback: (() => void | Promise<void>) | undefined
+    globalThis.setInterval = ((cb: () => void | Promise<void>) => {
+      tickCallback = cb
+      return { unref() {} }
+    }) as unknown as typeof setInterval
+
+    const warnMessages: string[] = []
+    console.warn = ((...args: unknown[]) => {
+      warnMessages.push(String(args[0]))
+    }) as typeof console.warn
+
+    try {
+      const { helpersModule, tempDir } =
+        await loadHelpersWithMultiAccountKeychain({
+          aExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
+          // Inside the 1h proactive window but well past the 60s reactive/
+          // CLI-fallback threshold: still-usable credentials that the fixed
+          // deferral guard should keep serving.
+          bExpiresAt: Date.now() + 10 * 60_000,
+          // Never resolves so refreshIfNeeded can't adopt its way out of the
+          // busy lock below — the deferral guard is the only thing that can
+          // avoid a null (and the warning it used to trigger).
+          bRefreshResult: "fail",
+        })
+
+      const plugin = await helpersModule.default({} as never)
+      assert.ok(tickCallback)
+
+      const typedPlugin = plugin as {
+        auth?: {
+          methods?: Array<{
+            authorize?: (i: { account?: string }) => Promise<unknown>
+          }>
+        }
+      }
+      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
+      warnMessages.length = 0 // ignore any warnings emitted during authorize
+
+      // Same tempDir credentials.ts imports "./refresh-lock.ts" from, so
+      // acquiring it here simulates a sibling OpenCode process/CLI holding
+      // the cross-process refresh lock for "acct-b" during the tick below.
+      const { acquireRefreshLock } = (await import(
+        pathToFileURL(join(tempDir, "refresh-lock.ts")).href
+      )) as {
+        acquireRefreshLock: (source: string) => { release(): void } | null
+      }
+      const held = acquireRefreshLock("acct-b")
+      assert.ok(held, "test acquires the lock to simulate another process")
+
+      try {
+        await tickCallback!()
+      } finally {
+        held!.release()
+      }
+
+      const proactiveWarnings = warnMessages.filter((m) =>
+        m.includes("Proactive token refresh failed"),
+      )
+      assert.equal(
+        proactiveWarnings.length,
+        0,
+        `A deferred refresh (busy lock, still-usable token) must not warn. Got: ${warnMessages}`,
       )
     } finally {
       globalThis.setInterval = originalSetInterval
