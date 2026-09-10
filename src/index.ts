@@ -31,6 +31,7 @@ import {
   saveAccountSource,
   refreshAccountsList,
   refreshIfNeeded,
+  wasRefreshDeferred,
   type ClaudeCredentials,
 } from "./credentials.ts"
 
@@ -171,6 +172,27 @@ export function buildRequestHeaders(
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 const PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
 
+/**
+ * Turns the active account's last refresh-failure classification into a
+ * message that says what actually happened, instead of one generic
+ * "re-authenticate" for both a genuinely dead refresh token and a passing
+ * rate-limit (opencode-claude-auth#281). getActiveRefreshFailureKind() folds
+ * an active cooldown into "transient", so "terminal" here means the token
+ * endpoint has explicitly rejected the refresh token itself
+ * (invalid_grant, ...) — the one case that actually requires signing in
+ * again.
+ */
+function describeCredentialFailure(): string {
+  const kind = getActiveRefreshFailureKind()
+  if (kind === "terminal") {
+    return "the stored refresh token is no longer valid. Run `claude` to sign in again."
+  }
+  if (kind === "transient") {
+    return "the token endpoint is currently rate-limiting refresh requests. This should clear on its own — run `claude` only if it keeps failing for several minutes."
+  }
+  return "no usable credentials were found. Run `claude` to sign in."
+}
+
 const plugin: Plugin = async () => {
   initLogger()
 
@@ -210,7 +232,7 @@ const plugin: Plugin = async () => {
       syncAuthJson(initialCreds)
     } else {
       console.warn(
-        "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate.",
+        `opencode-claude-auth: Claude credentials are unavailable — ${describeCredentialFailure()}`,
       )
     }
 
@@ -243,6 +265,16 @@ const plugin: Plugin = async () => {
             log("proactive_refresh_recovered", { source: account?.source })
           }
           proactiveRefreshWarned = false
+        } else if (account && wasRefreshDeferred(account.source)) {
+          // refreshIfNeeded stepped aside rather than failing — a cooldown
+          // from an earlier rate-limit was still armed, or a sibling
+          // process/the CLI held the refresh lock. Both are routine with
+          // multiple OpenCode instances sharing one account and say nothing
+          // about the credentials themselves, which is why this used to warn
+          // "re-authenticate" on tokens with hours of life left
+          // (opencode-claude-auth#272). Leave the once-per-outage latch
+          // alone: a real failure right after a deferral still reports.
+          log("proactive_refresh_deferred", { source: account.source })
         } else {
           log("proactive_refresh_failed", { source: account?.source })
           // Only warn once per outage — otherwise this fires every
@@ -250,7 +282,7 @@ const plugin: Plugin = async () => {
           if (!proactiveRefreshWarned) {
             proactiveRefreshWarned = true
             console.warn(
-              "opencode-claude-auth: Proactive token refresh failed. Run `claude` to re-authenticate.",
+              `opencode-claude-auth: Proactive token refresh failed — ${describeCredentialFailure()}`,
             )
           }
         }

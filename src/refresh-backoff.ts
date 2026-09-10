@@ -21,8 +21,22 @@ export const BASE_COOLDOWN_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000
 })()
 
-/** Hard ceiling for a single cooldown, regardless of consecutive failures. */
-export const MAX_COOLDOWN_MS = 60_000
+/**
+ * Hard ceiling for a single cooldown (env-overridable). A short cap here
+ * defeats its own purpose: the proactive sync timer polls every 5 minutes
+ * (`SYNC_INTERVAL` in index.ts), so a cap at or below that interval means the
+ * cooldown has always expired by the next tick and never actually gates the
+ * proactive path — every tick re-hits the token endpoint for as long as it
+ * keeps rate-limiting us, which is exactly the storm this module exists to
+ * prevent (see opencode-claude-auth#270). 30 minutes lets consecutive
+ * failures escalate past several proactive ticks while a single, isolated
+ * blip still only pays the short base cooldown.
+ */
+export const MAX_COOLDOWN_MS = (() => {
+  const raw = process.env.OPENCODE_CLAUDE_AUTH_REFRESH_MAX_COOLDOWN_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30 * 60_000
+})()
 
 /**
  * OAuth token-endpoint error codes that mean the refresh token itself is no
